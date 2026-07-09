@@ -89,7 +89,7 @@ from sqlalchemy import (
     func,
     update,
 )
-from sqlalchemy.engine import URL, Engine, make_url
+from sqlalchemy.engine import URL, Engine, Row, make_url
 from sqlalchemy.exc import (
     ArgumentError,
     IntegrityError,
@@ -101,6 +101,7 @@ from sqlalchemy.orm import (
     selectinload,
 )
 from sqlalchemy.sql.base import ExecutableOption
+from sqlalchemy.sql.elements import ColumnElement
 from sqlalchemy.util import immutabledict
 from sqlmodel import Session as SqlModelSession
 
@@ -139,7 +140,7 @@ from zenml.config.pipeline_run_configuration import (
 from zenml.config.secrets_store_config import SecretsStoreConfiguration
 from zenml.config.server_config import ServerConfiguration
 from zenml.config.source import Source
-from zenml.config.step_configurations import Step, StepConfiguration, StepSpec
+from zenml.config.step_configurations import StepConfiguration, StepSpec
 from zenml.config.store_config import StoreConfiguration
 from zenml.constants import (
     DEFAULT_PASSWORD,
@@ -396,7 +397,10 @@ from zenml.zen_stores import template_utils
 from zenml.zen_stores.base_zen_store import (
     BaseZenStore,
 )
-from zenml.zen_stores.dag_generator import DAGGeneratorHelper
+from zenml.zen_stores.dag_generator import (
+    DAGGeneratorHelper,
+    DAGStepView,
+)
 from zenml.zen_stores.migrations.alembic import (
     Alembic,
 )
@@ -6248,28 +6252,6 @@ class SqlZenStore(BaseZenStore):
                         jl_arg(StepRunSchema.start_time),
                         jl_arg(StepRunSchema.end_time),
                     ),
-                    selectinload(jl_arg(PipelineRunSchema.step_runs))
-                    .selectinload(jl_arg(StepRunSchema.input_artifacts))
-                    .joinedload(
-                        jl_arg(StepRunInputArtifactSchema.artifact_version),
-                        innerjoin=True,
-                    )
-                    .load_only(
-                        jl_arg(ArtifactVersionSchema.type),
-                        jl_arg(ArtifactVersionSchema.data_type),
-                        jl_arg(ArtifactVersionSchema.save_type),
-                    ),
-                    selectinload(jl_arg(PipelineRunSchema.step_runs))
-                    .selectinload(jl_arg(StepRunSchema.output_artifacts))
-                    .joinedload(
-                        jl_arg(StepRunOutputArtifactSchema.artifact_version),
-                        innerjoin=True,
-                    )
-                    .load_only(
-                        jl_arg(ArtifactVersionSchema.type),
-                        jl_arg(ArtifactVersionSchema.data_type),
-                        jl_arg(ArtifactVersionSchema.save_type),
-                    ),
                     selectinload(
                         jl_arg(PipelineRunSchema.step_runs)
                     ).selectinload(jl_arg(StepRunSchema.dynamic_config)),
@@ -6335,22 +6317,82 @@ class SqlZenStore(BaseZenStore):
             if snapshot.is_dynamic:
                 # Ignore static config templates for dynamic pipeline DAGs
                 steps = {
-                    name: Step.from_dict(
+                    name: DAGStepView.from_step_dict(
                         json.loads(step_run.dynamic_config.config),  # type: ignore[union-attr]
                         pipeline_configuration=pipeline_configuration,
-                        exclude_hook_sources=True,
                     )
                     for name, step_run in step_runs.items()
                 }
             else:
                 steps = {
-                    config_table.name: Step.from_dict(
+                    config_table.name: DAGStepView.from_step_dict(
                         json.loads(config_table.config),
                         pipeline_configuration=pipeline_configuration,
-                        exclude_hook_sources=False,
                     )
                     for config_table in snapshot.step_configurations
                 }
+
+            def _load_artifact_rows(
+                link_schema: Union[
+                    Type[StepRunInputArtifactSchema],
+                    Type[StepRunOutputArtifactSchema],
+                ],
+                extra_columns: List[ColumnElement[Any]],
+            ) -> Dict[UUID, List[Row[Any]]]:
+                columns: List[ColumnElement[Any]] = [
+                    col(link_schema.step_id).label("step_id"),
+                    col(link_schema.name).label("name"),
+                    col(link_schema.artifact_id).label("artifact_id"),
+                    *extra_columns,
+                    col(ArtifactVersionSchema.type).label("artifact_type"),
+                    col(ArtifactVersionSchema.data_type).label(
+                        "artifact_data_type"
+                    ),
+                    col(ArtifactVersionSchema.save_type).label(
+                        "artifact_save_type"
+                    ),
+                ]
+                query = (
+                    select(*columns)
+                    .join(
+                        StepRunSchema,
+                        col(StepRunSchema.id) == link_schema.step_id,
+                    )
+                    .join(
+                        ArtifactVersionSchema,
+                        col(ArtifactVersionSchema.id)
+                        == link_schema.artifact_id,
+                    )
+                    .where(
+                        col(StepRunSchema.pipeline_run_id) == pipeline_run_id
+                    )
+                )
+                rows: Dict[UUID, List[Row[Any]]] = defaultdict(list)
+                for row in session.execute(query):
+                    rows[row.step_id].append(row)
+
+                return rows
+
+            input_artifact_rows = _load_artifact_rows(
+                link_schema=StepRunInputArtifactSchema,
+                extra_columns=[
+                    col(StepRunInputArtifactSchema.type).label("type"),
+                    col(StepRunInputArtifactSchema.input_index).label(
+                        "input_index"
+                    ),
+                    col(StepRunInputArtifactSchema.chunk_index).label(
+                        "chunk_index"
+                    ),
+                    col(StepRunInputArtifactSchema.chunk_size).label(
+                        "chunk_size"
+                    ),
+                ],
+            )
+            output_artifact_rows = _load_artifact_rows(
+                link_schema=StepRunOutputArtifactSchema,
+                extra_columns=[],
+            )
+
             regular_output_artifact_nodes: Dict[
                 str, Dict[str, PipelineRunDAG.Node]
             ] = defaultdict(dict)
@@ -6404,7 +6446,7 @@ class SqlZenStore(BaseZenStore):
                 )
 
                 if step_run:
-                    for input in step_run.input_artifacts:
+                    for input in input_artifact_rows.get(step_run.id, []):
                         input_type = StepRunInputArtifactType(input.type)
 
                         if input_type == StepRunInputArtifactType.STEP_OUTPUT:
@@ -6453,11 +6495,11 @@ class SqlZenStore(BaseZenStore):
                                 ),
                                 id=input.artifact_id,
                                 name=input.name,
-                                type=input.artifact_version.type,
+                                type=input.artifact_type,
                                 data_type=Source.model_validate_json(
-                                    input.artifact_version.data_type
+                                    input.artifact_data_type
                                 ).import_path,
-                                save_type=input.artifact_version.save_type,
+                                save_type=input.artifact_save_type,
                             )
 
                         helper.add_edge(
@@ -6473,7 +6515,7 @@ class SqlZenStore(BaseZenStore):
                             artifact_node.node_id
                         )
 
-                    for output in step_run.output_artifacts:
+                    for output in output_artifact_rows.get(step_run.id, []):
                         # There is a very rare case where a node in the DAG
                         # already exists for an output artifact. This can happen
                         # when there are two steps that have no direct
@@ -6484,7 +6526,7 @@ class SqlZenStore(BaseZenStore):
                         # separately in the DAG, but if that should ever change
                         # this would be the place to merge them.
                         is_manual_save = (
-                            output.artifact_version.save_type
+                            output.artifact_save_type
                             == ArtifactSaveType.MANUAL
                         )
                         artifact_node = helper.add_artifact_node(
@@ -6498,26 +6540,26 @@ class SqlZenStore(BaseZenStore):
                                 if is_manual_save
                                 else output.name,
                                 step_name=step_name,
-                                io_type=output.artifact_version.save_type,
+                                io_type=output.artifact_save_type,
                                 is_input=False,
                             ),
                             id=output.artifact_id,
                             name=output.name,
-                            type=output.artifact_version.type,
+                            type=output.artifact_type,
                             data_type=Source.model_validate_json(
-                                output.artifact_version.data_type
+                                output.artifact_data_type
                             ).import_path,
-                            save_type=output.artifact_version.save_type,
+                            save_type=output.artifact_save_type,
                         )
 
                         helper.add_edge(
                             source=step_node.node_id,
                             target=artifact_node.node_id,
                             output_name=output.name,
-                            type=output.artifact_version.save_type,
+                            type=output.artifact_save_type,
                         )
                         if (
-                            output.artifact_version.save_type
+                            output.artifact_save_type
                             == ArtifactSaveType.STEP_OUTPUT
                         ):
                             regular_output_artifact_nodes[step_name][

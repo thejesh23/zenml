@@ -13,11 +13,77 @@
 #  permissions and limitations under the License.
 """DAG generator helper."""
 
-from typing import Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 from uuid import UUID
 
-from zenml.enums import ExecutionStatus
+from pydantic import BaseModel, ConfigDict
+
+from zenml.config.step_configurations import GroupInfo, StepSpec
+from zenml.enums import ExecutionStatus, StepType
 from zenml.models import PipelineRunDAG
+
+if TYPE_CHECKING:
+    from zenml.config.pipeline_configurations import PipelineConfiguration
+
+
+class DAGStepConfigView(BaseModel):
+    """Step configuration projection for DAG generation."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    step_type: Optional[StepType] = None
+    group: Optional[GroupInfo] = None
+    substitutions: Dict[str, str] = {}
+    outputs: Dict[str, Any] = {}
+    client_lazy_loaders: Dict[str, Any] = {}
+    model_artifacts_or_metadata: Dict[str, Any] = {}
+    external_input_artifacts: Dict[str, Any] = {}
+
+
+class DAGStepView(BaseModel):
+    """Step projection for DAG generation."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    spec: StepSpec
+    config: DAGStepConfigView
+
+    @classmethod
+    def from_step_dict(
+        cls,
+        data: Dict[str, Any],
+        pipeline_configuration: "PipelineConfiguration",
+    ) -> "DAGStepView":
+        """Build a lightweight step view from stored step config data.
+
+        Only the fields read during DAG generation are validated. The full
+        `Step.from_dict` parse validates the entire step configuration, which
+        is unnecessary here and expensive for runs with many steps.
+
+        Args:
+            data: The stored step data, containing `spec` and either `config`
+                or `step_config_overrides`.
+            pipeline_configuration: The pipeline configuration to propagate
+                substitutions from.
+
+        Returns:
+            The step view.
+        """
+        config_data = (
+            data["config"]
+            if "config" in data
+            else data["step_config_overrides"]
+        )
+        config_data = {
+            **config_data,
+            "substitutions": {
+                **pipeline_configuration.substitutions,
+                **(config_data.get("substitutions") or {}),
+            },
+        }
+        return cls.model_validate(
+            {"spec": data["spec"], "config": config_data}
+        )
 
 
 class DAGGeneratorHelper:
@@ -26,6 +92,7 @@ class DAGGeneratorHelper:
     def __init__(self) -> None:
         """Initialize the DAG generator helper."""
         self.step_nodes: Dict[str, PipelineRunDAG.Node] = {}
+        self.step_nodes_by_name: Dict[str, PipelineRunDAG.Node] = {}
         self.artifact_nodes: Dict[str, PipelineRunDAG.Node] = {}
         self.wait_condition_nodes: Dict[str, PipelineRunDAG.Node] = {}
         self.triggered_run_nodes: Dict[str, PipelineRunDAG.Node] = {}
@@ -130,6 +197,7 @@ class DAGGeneratorHelper:
             metadata=metadata,
         )
         self.step_nodes[step_node.node_id] = step_node
+        self.step_nodes_by_name[step_node.name] = step_node
         return step_node
 
     def add_artifact_node(
@@ -275,9 +343,8 @@ class DAGGeneratorHelper:
         Returns:
             The step node.
         """
-        for node in self.step_nodes.values():
-            if node.name == name:
-                return node
+        if node := self.step_nodes_by_name.get(name):
+            return node
         raise KeyError(f"Step node with name {name} not found")
 
     def finalize_dag(
